@@ -12,7 +12,7 @@ from openai import OpenAI
 # Tente d'initialiser le client OpenAI.
 # Il cherchera automatiquement la clé dans la variable d'environnement OPENAI_API_KEY.
 # Si vous préférez la mettre en dur pour le test, décommentez la ligne ci-dessous :
-client = OpenAI(api_key="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")
+client = OpenAI(api_key=)
 
 try:
     client = OpenAI()
