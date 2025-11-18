@@ -1,0 +1,193 @@
+import streamlit as st
+import re
+import fitz  # PyMuPDF pour PDF
+from docx import Document
+from io import BytesIO
+from openai import OpenAI
+
+# ----------------------------------------------------------------------
+# 1. Configuration de l'API et des Libs
+# ----------------------------------------------------------------------
+
+# Tente d'initialiser le client OpenAI.
+# Il cherchera automatiquement la clé dans la variable d'environnement OPENAI_API_KEY.
+# Si vous préférez la mettre en dur pour le test, décommentez la ligne ci-dessous :
+client = OpenAI(api_key="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")
+
+try:
+    client = OpenAI()
+except Exception as e:
+    st.error(f"Erreur d'initialisation de l'API OpenAI. Veuillez vérifier votre clé API ou sa variable d'environnement (OPENAI_API_KEY).")
+    # st.stop() # Ne pas stopper complètement Streamlit pour voir l'interface
+
+# ----------------------------------------------------------------------
+# 2. Fonctions d'Extraction (PDF et DOCX)
+# ----------------------------------------------------------------------
+
+def extract_text_docx(uploaded_file):
+    """Extrait le texte d'un fichier DOCX."""
+    try:
+        document = Document(uploaded_file)
+        return "\n".join([paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()])
+    except Exception as e:
+        st.error(f"Erreur extraction DOCX : {e}")
+        return ""
+
+def extract_text_pdf(uploaded_file):
+    """Extrait le texte d'un fichier PDF en utilisant PyMuPDF."""
+    try:
+        pdf_bytes = uploaded_file.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text() + "\n\n"
+        return text.strip()
+    except Exception as e:
+        st.error(f"Erreur extraction PDF : {e}")
+        return ""
+
+# ----------------------------------------------------------------------
+# 3. Fonction de Segmentation des Chapitres
+# ----------------------------------------------------------------------
+
+def segmenter_texte(document_text):
+    """
+    Découpe le texte en segments (chapitres) basés sur des patterns de titres numériques.
+    """
+    # Regex pour détecter les titres comme "1. Introduction", "2.1. Matériel", etc.
+    pattern = r"^\s*(\d+(\.\d+)*\s[A-ZÉÈÀÂÎÔÙÛa-zéèàâîôùû].*)$"
+    
+    titres_indices = [(m.start(), m.group(1).strip()) for m in re.finditer(pattern, document_text, re.MULTILINE)]
+    segments = []
+    
+    if not titres_indices:
+        return [{"titre": "Document Complet / Pas de Segmentation", "texte": document_text}]
+
+    # Logique de découpage basée sur les indices
+    for i, (start_index, titre) in enumerate(titres_indices):
+        if i + 1 < len(titres_indices):
+            end_index = titres_indices[i+1][0]
+        else:
+            end_index = len(document_text)
+            
+        texte_segment = document_text[start_index:end_index].replace(titre, "", 1).strip()
+        
+        if texte_segment:
+            segments.append({"titre": titre, "texte": texte_segment})
+            
+    # Ajouter le texte initial s'il existe (avant le premier titre numéroté)
+    if titres_indices[0][0] > 0:
+        texte_avant = document_text[:titres_indices[0][0]].strip()
+        if texte_avant:
+            segments.insert(0, {"titre": "0. Texte Préliminaire (Introduction, Remerciements)", "texte": texte_avant})
+
+    return segments
+
+# ----------------------------------------------------------------------
+# 4. Fonction d'Appel à l'API OpenAI
+# ----------------------------------------------------------------------
+
+def generer_questions_api(chapitres_segments):
+    """Appelle l'API OpenAI pour générer des questions pour chaque segment."""
+    questions_par_chapitre = []
+    
+    base_prompt = """
+    Role : Vous êtes un expert en pédagogie et en évaluation. Votre tâche est d'analyser le texte du chapitre ci-dessous et de générer une série de questions pertinentes pour évaluer la compréhension et la réflexion d'un étudiant.
+
+    Objectif : Générer 5 questions au total :
+    - 2 Questions de Compréhension (ex: Comment/Expliquez/Décrivez)
+    - 2 Questions sur les Concepts Clés (ex: Définissez/Quel est le rôle de)
+    - 1 Question de Réflexion Critique (ex: Quelles sont les limites/Comparez/Jugez l'efficacité)
+
+    Format de Sortie : Fournissez uniquement une liste numérotée des questions (ex: "1. Expliquez...", "2. Quel est le rôle..."), sans aucune autre explication ou texte introductif.
+    """
+
+    for chapitre in chapitres_segments:
+        titre = chapitre['titre']
+        # Tronquer le texte si trop long (limite de 10k caractères pour le test)
+        texte_limite = chapitre['texte'][:10000] 
+
+        if not texte_limite:
+             questions_par_chapitre.append({"titre": titre, "questions": ["(Aucun texte significatif trouvé pour ce chapitre.)"]})
+             continue
+        
+        prompt_final = f"{base_prompt}\n\nTitre du Chapitre : {titre}\n\nTexte du Chapitre :\n{texte_limite}"
+
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o", # Modèle rapide et performant
+                messages=[{"role": "user", "content": prompt_final}]
+            )
+            
+            # Nettoyer et stocker les questions générées
+            questions_list = [q.strip() for q in completion.choices[0].message.content.split('\n') if q.strip()]
+
+            questions_par_chapitre.append({"titre": titre, "questions": questions_list})
+            
+        except Exception as e:
+            questions_par_chapitre.append({"titre": titre, "questions": [f"Erreur API lors de la génération. Le texte était peut-être trop long ou la clé API est incorrecte. Détail: {e}"]})
+
+    return questions_par_chapitre
+
+# ----------------------------------------------------------------------
+# 5. Interface Streamlit (Application Principale)
+# ----------------------------------------------------------------------
+
+st.set_page_config(layout="wide", page_title="QG Pédagogique (PPE)")
+
+st.title("🧠 Génération Automatique de Questions pour Rapports (PPE)")
+st.caption("Prototype développé pour l'évaluation et l'auto-évaluation à partir de rapports PDF/DOCX.")
+
+uploaded_file = st.file_uploader(
+    "1. Choisissez votre Rapport de Stage (PDF ou DOCX)",
+    type=['pdf', 'docx']
+)
+
+if uploaded_file is not None:
+    
+    # 2. Extraction du Texte
+    file_type = uploaded_file.type
+    if file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        document_text = extract_text_docx(uploaded_file)
+    elif file_type == "application/pdf":
+        document_text = extract_text_pdf(uploaded_file)
+    else:
+        document_text = ""
+    
+    if not document_text.strip():
+        st.warning("Impossible d'extraire le texte du document. Veuillez vérifier le format.")
+        st.stop()
+        
+    col1, col2 = st.columns([1, 1])
+
+    # --- COLONNE 1 : Affichage du Document ---
+    with col1:
+        st.header("📖 Document Original (Texte Extrait)")
+        st.text_area(
+            "Contenu textuel du rapport (premiers caractères) :",
+            document_text[:20000] + ("..." if len(document_text) > 20000 else ""),
+            height=600,
+            key="document_viewer"
+        )
+        
+    # --- COLONNE 2 : Génération et Affichage des Questions ---
+    with col2:
+        st.header("❓ Questions Générées par Chapitre")
+        
+        if st.button("2. Lancer la Génération des Questions", type="primary"):
+            
+            with st.spinner('Analyse, segmentation et appel à l\'IA en cours... (Durée variable selon la taille du rapport)'):
+                
+                # A. Segmentation
+                chapitres_segments = segmenter_texte(document_text)
+                st.info(f"Segmentation réussie : **{len(chapitres_segments)}** chapitres/sections détectés.")
+                
+                # B. Génération des Questions
+                questions_par_chapitre = generer_questions_api(chapitres_segments)
+                
+                # C. Affichage des Résultats
+                for resultat in questions_par_chapitre:
+                    st.subheader(f"✅ {resultat['titre']}")
+                    questions_markdown = "\n".join(resultat['questions'])
+                    st.markdown(questions_markdown)
+                    st.markdown("---")
